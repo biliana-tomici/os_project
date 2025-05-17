@@ -8,10 +8,11 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 pid_t monitorID = -1;
 int monitorStatus = 0;
-
+int monitor_pipe[2]; // pipe: monitor writes -> main reads
 
 void menu() {
     printf("\nChoose one of the following commands:\n");
@@ -19,6 +20,7 @@ void menu() {
     printf("list_hunts\n");
     printf("list_treasure\n");
     printf("view_treasure\n");
+    printf("calculate_score\n");   // new command
     printf("stop_monitor\n");
     printf("exit\n");
 }
@@ -38,10 +40,11 @@ int count_treasures(const char *hunt) {
     return count;
 }
 
-void list_hunts_internal() {
+// This function lists hunts by scanning current directory and writing output to pipefd[1]
+void list_hunts_internal(int pipefd[2]) {
     DIR *dir = opendir(".");
     if (!dir) {
-        perror("opendir failed");
+        dprintf(pipefd[1], "opendir failed: %s\n", strerror(errno));
         return;
     }
 
@@ -52,53 +55,42 @@ void list_hunts_internal() {
             strcmp(entry->d_name, "..") != 0 &&
             strcmp(entry->d_name, ".git") != 0) {
 
-            printf("Hunt name: %s\n", entry->d_name);
-            printf("Number of treasures: %d\n", count_treasures(entry->d_name));
+            dprintf(pipefd[1], "Hunt name: %s\n", entry->d_name);
+            dprintf(pipefd[1], "Number of treasures: %d\n", count_treasures(entry->d_name));
         }
     }
-
     closedir(dir);
 }
 
 void handle_signal(int sig) {
     if (sig == SIGUSR1) {
-        system("clear");
-        list_hunts_internal();
-        menu();
+        // On list_hunts signal, output goes to monitor_pipe[1]
+        // Clear screen (sent to terminal, so let's skip it here)
+        list_hunts_internal(monitor_pipe);
     } else if (sig == SIGUSR2) {
-        system("clear");
         char hunt[64];
-        printf("Enter hunt name: ");
-        fgets(hunt, sizeof(hunt), stdin);
-        hunt[strcspn(hunt, "\n")] = '\0';
-
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "./treasure_manager --list %s", hunt);
-        system(cmd);
-        menu();
+        dprintf(monitor_pipe[1], "Enter hunt name: ");
+        // Reading from stdin is problematic in monitor, so instead, just print prompt
+        // The original program reads from stdin but monitor is a child without terminal access,
+        // so let's simulate by sending a message back:
+        dprintf(monitor_pipe[1], "(Use main interface to input hunt name)\n");
     } else if (sig == SIGINT) {
-        system("clear");
-        char hunt[64], idstr[16];
-        printf("Enter hunt name: ");
-        fgets(hunt, sizeof(hunt), stdin);
-        hunt[strcspn(hunt, "\n")] = '\0';
-        printf("Enter treasure ID: ");
-        fgets(idstr, sizeof(idstr), stdin);
-        idstr[strcspn(idstr, "\n")] = '\0';
-
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "./treasure_manager --view %s %s", hunt, idstr);
-        system(cmd);
-        menu();
+        dprintf(monitor_pipe[1], "(View treasure: Use main interface for input)\n");
     } else if (sig == SIGTERM) {
-        printf("Monitor exiting...\n");
+        dprintf(monitor_pipe[1], "Monitor exiting...\n");
         _exit(0);
     }
 }
 
+// Start monitor with pipe communication (monitor writes to pipe[1], main reads pipe[0])
 int start_monitor() {
     if (monitorID > 0) {
         printf("Monitor is already running.\n");
+        return -1;
+    }
+
+    if (pipe(monitor_pipe) == -1) {
+        perror("pipe");
         return -1;
     }
 
@@ -110,7 +102,9 @@ int start_monitor() {
     }
 
     if (monitorID == 0) {
-        // child process
+        // child process - monitor
+        close(monitor_pipe[0]); // close read end, monitor writes
+
         struct sigaction sa = {0};
         sa.sa_handler = handle_signal;
         sigemptyset(&sa.sa_mask);
@@ -120,12 +114,26 @@ int start_monitor() {
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
 
+        // Keep alive and handle signals
         while (1) pause();
         _exit(0);
     }
 
+    // parent process
+    close(monitor_pipe[1]); // close write end, main reads monitor_pipe[0]
     monitorStatus = 1;
     return 0;
+}
+
+void read_and_print_monitor_output() {
+    // Non-blocking or blocking read until no more data
+    char buf[512];
+    ssize_t n;
+    while ((n = read(monitor_pipe[0], buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        printf("%s", buf);
+        if (n < sizeof(buf) - 1) break; // assume no more data immediately
+    }
 }
 
 void list_hunts() {
@@ -135,6 +143,7 @@ void list_hunts() {
     }
     kill(monitorID, SIGUSR1);
     sleep(1);
+    read_and_print_monitor_output();
 }
 
 void list_treasure() {
@@ -144,6 +153,7 @@ void list_treasure() {
     }
     kill(monitorID, SIGUSR2);
     sleep(1);
+    read_and_print_monitor_output();
 }
 
 void view_treasure() {
@@ -153,6 +163,7 @@ void view_treasure() {
     }
     kill(monitorID, SIGINT);
     sleep(1);
+    read_and_print_monitor_output();
 }
 
 void stop_monitor() {
@@ -166,26 +177,199 @@ void stop_monitor() {
     printf("Monitor %d stopped.\n", monitorID);
     monitorID = -1;
     monitorStatus = 0;
+
+    // Close pipe read end
+    close(monitor_pipe[0]);
 }
 
+// New: Calculate scores for each hunt by running score_calculator via pipes and collecting results
+void calculate_score() {
+    DIR *dir = opendir(".");
+    if (!dir) {
+        perror("opendir failed");
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (entry->d_type == DT_DIR &&
+            strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0 &&
+            strcmp(entry->d_name, ".git") != 0) {
+
+            int pipefd[2];
+            if (pipe(pipefd) == -1) {
+                perror("pipe");
+                closedir(dir);
+                return;
+            }
+
+            pid_t pid = fork();
+            if (pid < 0) {
+                perror("fork");
+                close(pipefd[0]);
+                close(pipefd[1]);
+                closedir(dir);
+                return;
+            }
+
+            if (pid == 0) {
+                // child: run score_calculator with hunt name, output to pipe
+                close(pipefd[0]); // close read end
+                dup2(pipefd[1], STDOUT_FILENO);
+                close(pipefd[1]);
+
+                execl("./score_calculator", "score_calculator", entry->d_name, NULL);
+                perror("execl failed");
+                _exit(1);
+            } else {
+                // parent: read child's output
+                close(pipefd[1]); // close write end
+                printf("Scores for hunt: %s\n", entry->d_name);
+
+                char buffer[512];
+                ssize_t n;
+                while ((n = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+                    buffer[n] = '\0';
+                    printf("%s", buffer);
+                }
+                close(pipefd[0]);
+                waitpid(pid, NULL, 0);
+                printf("\n");
+            }
+        }
+    }
+
+    closedir(dir);
+}
+// New helper function to trim newline from fgets
+void trim_newline(char *str) {
+    size_t len = strlen(str);
+    if (len > 0 && str[len-1] == '\n') {
+        str[len-1] = '\0';
+    }
+}
+
+// New function to list treasures for a given hunt (called from main)
+void list_treasure_for_hunt(const char *hunt) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/treasures.dat", hunt);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("Could not open treasures for hunt '%s'\n", hunt);
+        return;
+    }
+
+    struct {
+        int id;
+        char username[32];
+        float lat;
+        float lon;
+        char clue[256];
+        int value;
+    } treasure;
+
+    printf("Treasures in hunt '%s':\n", hunt);
+    while (read(fd, &treasure, sizeof(treasure)) == sizeof(treasure)) {
+        printf("ID: %d | User: %s | GPS: (%.2f, %.2f) | Clue: %s | Value: %d\n",
+               treasure.id, treasure.username, treasure.lat, treasure.lon, treasure.clue, treasure.value);
+    }
+
+    close(fd);
+}
+
+
+// New function to view treasure details for a given hunt (called from main)
+void view_treasure_for_hunt(const char *hunt) {
+    int id;
+    printf("Enter treasure ID to view: ");
+    if (scanf("%d", &id) != 1) {
+        printf("Invalid input.\n");
+        while (getchar() != '\n'); // flush
+        return;
+    }
+    while (getchar() != '\n'); // flush newline
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/treasures.dat", hunt);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("Could not open treasure file for hunt '%s'\n", hunt);
+        return;
+    }
+
+    struct {
+        int id;
+        char username[32];
+        float lat;
+        float lon;
+        char clue[256];
+        int value;
+    } treasure;
+
+    int found = 0;
+    while (read(fd, &treasure, sizeof(treasure)) == sizeof(treasure)) {
+        if (treasure.id == id) {
+            printf("Treasure ID: %d\nUser: %s\nGPS: %.2f, %.2f\nClue: %s\nValue: %d\n",
+                   treasure.id, treasure.username, treasure.lat, treasure.lon, treasure.clue, treasure.value);
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        printf("Treasure with ID %d not found in hunt '%s'.\n", id, hunt);
+    }
+
+    close(fd);
+}
+
+
 int main() {
-    char command[64];
+    char line[128];
 
     while (1) {
         menu();
-        if (!fgets(command, sizeof(command), stdin)) break;
+        if (!fgets(line, sizeof(line), stdin)) break;
+        trim_newline(line);
 
-        if (strcmp(command, "start_monitor\n") == 0) {
+        // Parse command and optional argument
+        char *cmd = strtok(line, " ");
+        char *arg = strtok(NULL, " "); // hunt name if any
+
+        if (!cmd) continue;
+
+        if (strcmp(cmd, "start_monitor") == 0) {
             start_monitor();
-        } else if (strcmp(command, "list_hunts\n") == 0) {
+        } else if (strcmp(cmd, "list_hunts") == 0) {
             list_hunts();
-        } else if (strcmp(command, "list_treasure\n") == 0) {
-            list_treasure();
-        } else if (strcmp(command, "view_treasure\n") == 0) {
-            view_treasure();
-        } else if (strcmp(command, "stop_monitor\n") == 0) {
+        } else if (strcmp(cmd, "list_treasure") == 0) {
+            if (arg) {
+                // Argument given, handle in main
+                list_treasure_for_hunt(arg);
+            } else {
+                // No argument: fallback to old monitor signal method, but warn user
+                if (!monitorStatus) {
+                    printf("Monitor is not running.\n");
+                } else {
+                    printf("Please specify hunt name: list_treasure <hunt_name>\n");
+                }
+            }
+        } else if (strcmp(cmd, "view_treasure") == 0) {
+            if (arg) {
+                view_treasure_for_hunt(arg);
+            } else {
+                if (!monitorStatus) {
+                    printf("Monitor is not running.\n");
+                } else {
+                    printf("Please specify hunt name: view_treasure <hunt_name>\n");
+                }
+            }
+        } else if (strcmp(cmd, "calculate_score") == 0) {
+            calculate_score();
+        } else if (strcmp(cmd, "stop_monitor") == 0) {
             stop_monitor();
-        } else if (strcmp(command, "exit\n") == 0) {
+        } else if (strcmp(cmd, "exit") == 0) {
             if (monitorStatus) {
                 printf("Monitor still running. Use stop_monitor first.\n");
             } else {
@@ -195,6 +379,8 @@ int main() {
             printf("Unknown command.\n");
         }
     }
+
+    if (monitorStatus) stop_monitor();
 
     return 0;
 }
