@@ -20,7 +20,7 @@ void menu() {
     printf("list_hunts\n");
     printf("list_treasure\n");
     printf("view_treasure\n");
-    printf("calculate_score\n");   // new command
+    printf("calculate_score\n");   
     printf("stop_monitor\n");
     printf("exit\n");
 }
@@ -64,15 +64,10 @@ void list_hunts_internal(int pipefd[2]) {
 
 void handle_signal(int sig) {
     if (sig == SIGUSR1) {
-        // On list_hunts signal, output goes to monitor_pipe[1]
-        // Clear screen (sent to terminal, so let's skip it here)
         list_hunts_internal(monitor_pipe);
     } else if (sig == SIGUSR2) {
         char hunt[64];
         dprintf(monitor_pipe[1], "Enter hunt name: ");
-        // Reading from stdin is problematic in monitor, so instead, just print prompt
-        // The original program reads from stdin but monitor is a child without terminal access,
-        // so let's simulate by sending a message back:
         dprintf(monitor_pipe[1], "(Use main interface to input hunt name)\n");
     } else if (sig == SIGINT) {
         dprintf(monitor_pipe[1], "(View treasure: Use main interface for input)\n");
@@ -182,7 +177,6 @@ void stop_monitor() {
     close(monitor_pipe[0]);
 }
 
-// New: Calculate scores for each hunt by running score_calculator via pipes and collecting results
 void calculate_score() {
     DIR *dir = opendir(".");
     if (!dir) {
@@ -242,7 +236,7 @@ void calculate_score() {
 
     closedir(dir);
 }
-// New helper function to trim newline from fgets
+
 void trim_newline(char *str) {
     size_t len = strlen(str);
     if (len > 0 && str[len-1] == '\n') {
@@ -250,7 +244,6 @@ void trim_newline(char *str) {
     }
 }
 
-// New function to list treasures for a given hunt (called from main)
 void list_treasure_for_hunt(const char *hunt) {
     char path[256];
     snprintf(path, sizeof(path), "%s/treasures.dat", hunt);
@@ -279,16 +272,16 @@ void list_treasure_for_hunt(const char *hunt) {
 }
 
 
-// New function to view treasure details for a given hunt (called from main)
+
 void view_treasure_for_hunt(const char *hunt) {
     int id;
     printf("Enter treasure ID to view: ");
     if (scanf("%d", &id) != 1) {
         printf("Invalid input.\n");
-        while (getchar() != '\n'); // flush
+        while (getchar() != '\n'); 
         return;
     }
-    while (getchar() != '\n'); // flush newline
+    while (getchar() != '\n'); 
 
     char path[256];
     snprintf(path, sizeof(path), "%s/treasures.dat", hunt);
@@ -327,7 +320,6 @@ void view_treasure_for_hunt(const char *hunt) {
 
 int main() {
     char line[128];
-
     while (1) {
         menu();
         if (!fgets(line, sizeof(line), stdin)) break;
@@ -348,7 +340,7 @@ int main() {
                 // Argument given, handle in main
                 list_treasure_for_hunt(arg);
             } else {
-                // No argument: fallback to old monitor signal method, but warn user
+                
                 if (!monitorStatus) {
                     printf("Monitor is not running.\n");
                 } else {

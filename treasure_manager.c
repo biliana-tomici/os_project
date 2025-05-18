@@ -251,7 +251,7 @@ void remove_hunt(const char *hunt_id) {
     write(STDOUT_FILENO, output, len);
 }
 
-// Main program entry
+
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         char usage[] = "Usage: ./treasure_manager --<operation> <hunt_id> [<id>]\n";
